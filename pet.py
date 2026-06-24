@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QSlider, QPushButton, QFileDialog, QGridLayout,
 )
-from PyQt6.QtCore import Qt, QTimer, QRect, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QRect, QPoint, QThread, pyqtSignal
 from PyQt6.QtGui  import QPainter, QPixmap, QTransform, QDragEnterEvent, QDropEvent, QBrush, QColor, QPen, QPainterPath
 
 try:
@@ -27,6 +27,19 @@ try:
     PYNPUT = True
 except ImportError:
     PYNPUT = False
+
+# pynput's keyboard.Listener spins its own thread, but on macOS some HIToolbox
+# calls it triggers (TSMGetInputSourceProperty) assert they run on the main
+# thread and crash with SIGTRAP otherwise — so on macOS we use a CGEventTap
+# on the main run loop instead. Off macOS, fall back to pynput.keyboard.
+if not MACOS:
+    try:
+        from pynput import keyboard as _keyboard
+        PYNPUT_KEYBOARD = True
+    except ImportError:
+        PYNPUT_KEYBOARD = False
+else:
+    PYNPUT_KEYBOARD = False
 
 OWN_PID = os.getpid()
 HERE    = Path(__file__).parent
@@ -177,17 +190,92 @@ def _flipped(pm: QPixmap) -> QPixmap:
     return pm.transformed(QTransform().scale(-1, 1))
 
 def draw_cat(painter: QPainter, win_w: int, win_h: int,
-             frame: int, moving: bool, facing_right: bool):
+             frame: int, moving: bool, facing_right: bool) -> int:
+    """Draws the cat and returns the y-coordinate of its top (head)."""
     pm = _SPRITES.get(f'walk{frame % 3}', _SPRITES['rest']) if moving else _SPRITES['rest']
     if facing_right:
         pm = _flipped(pm)
-    painter.drawPixmap((win_w - pm.width()) // 2, win_h - pm.height(), pm)
+    top = win_h - pm.height()
+    painter.drawPixmap((win_w - pm.width()) // 2, top, pm)
+    return top
+
+
+def draw_hunger_bar(painter: QPainter, win_w: int, hunger: float, cat_top: int) -> int:
+    """Draws the hunger bar and returns the y-coordinate of its top."""
+    bar_w, bar_h = 36, 5
+    x = (win_w - bar_w) // 2
+    y = max(2, cat_top - bar_h - 4)
+    pct = max(0.0, min(1.0, hunger / 100.0))
+
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(QColor(40, 40, 40, 150)))
+    painter.drawRoundedRect(x, y, bar_w, bar_h, 2, 2)
+
+    if pct < 0.3:
+        fill = QColor(231, 76, 60)
+    elif pct < 0.6:
+        fill = QColor(241, 196, 15)
+    else:
+        fill = QColor(46, 204, 113)
+    painter.setBrush(QBrush(fill))
+    painter.drawRoundedRect(x, y, max(1, int(bar_w * pct)), bar_h, 2, 2)
+
+    if hunger < 20:
+        painter.setPen(QPen(QColor(255, 255, 255)))
+        f = painter.font()
+        f.setPointSize(9)
+        painter.setFont(f)
+        painter.drawText(x - 10, y - 2, bar_w + 20, 16,
+                          Qt.AlignmentFlag.AlignCenter, '🍖')
+
+    return y
+
+
+def draw_speech_bubble(painter: QPainter, win_w: int, text: str, bottom_y: int):
+    """Draws a speech bubble whose bottom-tip sits just above bottom_y."""
+    if not text:
+        return
+    painter.save()
+    f = painter.font()
+    f.setPointSize(9)
+    f.setBold(True)
+    painter.setFont(f)
+    metrics = painter.fontMetrics()
+
+    pad_x, pad_y = 7, 4
+    text_w   = min(metrics.horizontalAdvance(text), win_w - 10)
+    bubble_w = text_w + pad_x * 2
+    bubble_h = metrics.height() + pad_y * 2
+    x = max(2, (win_w - bubble_w) // 2)
+    y = max(2, bottom_y - bubble_h - 6)
+
+    painter.setPen(QPen(QColor(90, 90, 90), 1))
+    painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
+    painter.drawRoundedRect(x, y, bubble_w, bubble_h, 7, 7)
+
+    cx = win_w // 2
+    tri = QPainterPath()
+    tri.moveTo(cx - 5, y + bubble_h - 1)
+    tri.lineTo(cx + 5, y + bubble_h - 1)
+    tri.lineTo(cx, y + bubble_h + 5)
+    tri.closeSubpath()
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
+    painter.drawPath(tri)
+
+    painter.setPen(QPen(QColor(40, 40, 40)))
+    painter.drawText(QRect(x, y, bubble_w, bubble_h),
+                      Qt.AlignmentFlag.AlignCenter, text)
+    painter.restore()
 
 
 # ── pet logic ──────────────────────────────────────────────────────────────────
 
 class Pet:
-    ARRIVE = 6
+    ARRIVE        = 6
+    HUNGER_FULL   = 100.0
+    HUNGER_DECAY  = 100.0 / 1800.0   # fully empties in 30 minutes if never fed
+    KEYS_PER_BOWL = 5000             # keystrokes needed to earn one bowl of food
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -202,6 +290,38 @@ class Pet:
         self.frame        = 0
         self.frame_t      = 0.0
         self.next_wander  = random.uniform(cfg.wander_min, cfg.wander_max)
+        self.hunger         = self.HUNGER_FULL
+        self.bowls          = 0   # complete bowls of food, earned and ready to feed
+        self.progress_keys  = 0   # keystrokes typed toward the next bowl
+        self._key_pending   = 0   # buffer filled by the key-tap callback
+        self.working        = True   # False = paused, keystrokes don't count
+        self.speech          = ''
+        self.speech_t        = 0.0
+
+    def add_keystrokes(self, count: int):
+        self._key_pending += count
+
+    def toggle_work(self):
+        self.working = not self.working
+        self.speech   = '现在主人努力打猎中' if self.working else '现在主人在摸鱼中'
+        self.speech_t = 2.5
+
+    def feed(self):
+        """Consume one bowl of food — fully satiates the pet."""
+        if self.bowls > 0:
+            self.bowls  -= 1
+            self.hunger  = self.HUNGER_FULL
+
+    @property
+    def bowl_progress(self) -> float:
+        return self.progress_keys / self.KEYS_PER_BOWL
+
+    @property
+    def hunger_speed_factor(self) -> float:
+        """Starving pets move sluggishly."""
+        if self.hunger >= 40:
+            return 1.0
+        return 0.4 + 0.6 * (self.hunger / 40.0)
 
     @property
     def margin(self):
@@ -228,6 +348,22 @@ class Pet:
             self.frame_t  = 0.0
             self.frame    = (self.frame + 1) % 4
 
+        # keystrokes fill the current bowl; once full, a bowl becomes available
+        # (only while "working" — paused while slacking off)
+        if self._key_pending:
+            if self.working:
+                self.progress_keys += self._key_pending
+                while self.progress_keys >= self.KEYS_PER_BOWL:
+                    self.progress_keys -= self.KEYS_PER_BOWL
+                    self.bowls         += 1
+            self._key_pending = 0
+        self.hunger = max(0.0, self.hunger - self.HUNGER_DECAY * dt)
+
+        if self.speech_t > 0:
+            self.speech_t -= dt
+            if self.speech_t <= 0:
+                self.speech = ''
+
         if not self.chasing:
             self.next_wander -= dt
             if self.next_wander <= 0:
@@ -238,7 +374,8 @@ class Pet:
         prev_x, prev_y = self.x, self.y
 
         if d > self.ARRIVE:
-            step          = min(self.spd * dt, d)
+            speed         = self.spd * self.hunger_speed_factor
+            step          = min(speed * dt, d)
             self.x       += dx/d * step
             self.y       += dy/d * step
             self.facing_right = dx >= 0
@@ -287,34 +424,37 @@ class HomeButton(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip('Send pet home')
+        self._native_ready = False
 
-        # show off-screen first so the native window handle is valid for macOS config
-        self.move(-9999, -9999)
-        self.show()
-
-        if MACOS:
-            try:
-                import objc
-                from AppKit import (NSColor, NSStatusWindowLevel,
-                    NSWindowCollectionBehaviorCanJoinAllSpaces,
-                    NSWindowCollectionBehaviorStationary,
-                    NSWindowCollectionBehaviorFullScreenAuxiliary)
-                ns = objc.objc_object(c_void_p=int(self.winId())).window()
-                ns.setHidesOnDeactivate_(False)
-                ns.setHasShadow_(False)
-                ns.setOpaque_(False)
-                ns.setBackgroundColor_(NSColor.clearColor())
-                ns.setLevel_(NSStatusWindowLevel)
-                ns.setCollectionBehavior_(
-                    NSWindowCollectionBehaviorCanJoinAllSpaces
-                    | NSWindowCollectionBehaviorStationary
-                    | NSWindowCollectionBehaviorFullScreenAuxiliary)
-            except Exception as e:
-                print(f'[home] {e}')
+    def _setup_native(self):
+        if self._native_ready or not MACOS:
+            return
+        self._native_ready = True
+        try:
+            import objc
+            from AppKit import (NSColor, NSStatusWindowLevel,
+                NSWindowCollectionBehaviorCanJoinAllSpaces,
+                NSWindowCollectionBehaviorStationary,
+                NSWindowCollectionBehaviorFullScreenAuxiliary)
+            ns = objc.objc_object(c_void_p=int(self.winId())).window()
+            ns.setHidesOnDeactivate_(False)
+            ns.setHasShadow_(False)
+            ns.setOpaque_(False)
+            ns.setBackgroundColor_(NSColor.clearColor())
+            ns.setLevel_(NSStatusWindowLevel)
+            ns.setCollectionBehavior_(
+                NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehaviorStationary
+                | NSWindowCollectionBehaviorFullScreenAuxiliary)
+        except Exception as e:
+            print(f'[home] {e}')
 
     def update_pos(self, bounds: QRect):
         w, h = self._pm.width(), self._pm.height()
         self.move(bounds.right() - w - 2, bounds.top() + 2)
+        if not self.isVisible():
+            self.show()
+            self._setup_native()
 
     def mousePressEvent(self, _):
         c = self.mapToGlobal(self.rect().center())
@@ -326,6 +466,186 @@ class HomeButton(QWidget):
         p.fillRect(self.rect(), Qt.GlobalColor.transparent)
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         p.drawPixmap(0, 0, self._pm)
+        p.end()
+
+
+def _circular_pixmap(src: QPixmap, d: int) -> QPixmap:
+    """Fit src inside a solid-white circle of diameter d (a sticker/badge look)."""
+    pad   = max(2, int(d * 0.12))   # margin so the food doesn't touch the edge
+    inner = d - pad * 2
+    scaled = src.scaled(inner, inner, Qt.AspectRatioMode.KeepAspectRatio,
+                         Qt.TransformationMode.SmoothTransformation)
+
+    result = QPixmap(d, d)
+    result.fill(Qt.GlobalColor.transparent)
+    p = QPainter(result)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addEllipse(0, 0, d, d)
+    p.setClipPath(path)
+    p.fillRect(0, 0, d, d, QColor(255, 255, 255))
+
+    x = (d - scaled.width())  // 2
+    y = (d - scaled.height()) // 2
+    p.drawPixmap(x, y, scaled)
+    p.end()
+    return result
+
+
+class FoodButton(QWidget):
+    """Cat-food bowl pinned to the top-left of the active window.
+    A ring around the bowl fills as you type — full ring = one bowl earned.
+    The red badge shows how many whole bowls are stockpiled; click feeds one."""
+    feed_clicked = pyqtSignal()
+
+    LABEL_H = 30
+
+    def __init__(self, size: int = 64):
+        super().__init__()
+        self._size      = size
+        self._width     = max(size, 96)   # extra width to fit food% + hunger%
+        self.progress   = 0.0   # 0..1 progress toward the next bowl
+        self.bowls      = 0     # whole bowls stockpiled, ready to feed
+        self.keys_now   = 0
+        self.keys_goal  = Pet.KEYS_PER_BOWL
+        self.hunger_pct = 100
+        self.setFixedSize(self._width, size + self.LABEL_H)
+
+        icon_d = max(8, size - 2 * (4 + 4))   # matches the inset used when drawing
+        self._icon_pm = _circular_pixmap(QPixmap(str(HERE / 'food_clean.png')), icon_d)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip('Click to feed the cat')
+        self._native_ready = False
+
+    def _setup_native(self):
+        if self._native_ready or not MACOS:
+            return
+        self._native_ready = True
+        try:
+            import objc
+            from AppKit import (NSColor, NSStatusWindowLevel,
+                NSWindowCollectionBehaviorCanJoinAllSpaces,
+                NSWindowCollectionBehaviorStationary,
+                NSWindowCollectionBehaviorFullScreenAuxiliary)
+            ns = objc.objc_object(c_void_p=int(self.winId())).window()
+            ns.setHidesOnDeactivate_(False)
+            ns.setHasShadow_(False)
+            ns.setOpaque_(False)
+            ns.setBackgroundColor_(NSColor.clearColor())
+            ns.setLevel_(NSStatusWindowLevel)
+            ns.setCollectionBehavior_(
+                NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehaviorStationary
+                | NSWindowCollectionBehaviorFullScreenAuxiliary)
+        except Exception as e:
+            print(f'[food] {e}')
+
+    def update_pos(self, bounds: QRect):
+        self.move(bounds.x() + 2, bounds.top() + 2)
+        if not self.isVisible():
+            self.show()
+            self._setup_native()
+
+    def set_progress(self, progress: float, bowls: int, keys_now: int,
+                      keys_goal: int, hunger_pct: int):
+        progress = max(0.0, min(1.0, progress))
+        if (progress != self.progress or bowls != self.bowls
+                or keys_now != self.keys_now or hunger_pct != self.hunger_pct):
+            self.progress   = progress
+            self.bowls      = bowls
+            self.keys_now   = keys_now
+            self.keys_goal  = keys_goal
+            self.hunger_pct = hunger_pct
+            self.update()
+
+    def mousePressEvent(self, _):
+        self.feed_clicked.emit()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+        p.fillRect(self.rect(), Qt.GlobalColor.transparent)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
+        s        = self._size
+        icon_x   = (self._width - s) // 2
+        icon_rect = QRect(icon_x, 0, s, s)
+        ring     = 4
+        ring_rect = icon_rect.adjusted(ring//2 + 1, ring//2 + 1,
+                                        -(ring//2 + 1), -(ring//2 + 1))
+
+        # background ring (unfilled track)
+        p.setPen(QPen(QColor(0, 0, 0, 50), ring))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(ring_rect, 0, 360 * 16)
+
+        # progress ring — fills clockwise from the top as you type
+        if self.progress > 0:
+            p.setPen(QPen(QColor(46, 204, 113), ring))
+            span = -int(self.progress * 360 * 16)
+            p.drawArc(ring_rect, 90 * 16, span)
+
+        # food icon (image)
+        px = icon_x + (s - self._icon_pm.width()) // 2
+        py = (s - self._icon_pm.height()) // 2
+        p.drawPixmap(px, py, self._icon_pm)
+
+        # red badge — whole bowls stockpiled
+        if self.bowls > 0:
+            bd = max(15, s // 3)
+            bx, by = icon_x + s - bd - 1, s - bd - 1
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(231, 76, 60)))
+            p.drawEllipse(bx, by, bd, bd)
+            bf = p.font()
+            bf.setPointSize(max(8, int(bd * 0.5)))
+            bf.setBold(True)
+            p.setFont(bf)
+            p.setPen(QPen(QColor(255, 255, 255)))
+            p.drawText(bx, by, bd, bd, Qt.AlignmentFlag.AlignCenter,
+                       str(min(self.bowls, 99)))
+
+        # label below the icon: "keys earned / goal", then food% next to hunger%
+        label_rect = QRect(0, s, self._width, self.LABEL_H)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(30, 30, 30, 175)))
+        p.drawRoundedRect(label_rect.adjusted(0, 0, 0, -2), 6, 6)
+
+        p.setPen(QPen(QColor(255, 255, 255)))
+        f1 = p.font()
+        f1.setPointSize(9)
+        f1.setBold(True)
+        p.setFont(f1)
+        p.drawText(label_rect.adjusted(0, 2, 0, -15), Qt.AlignmentFlag.AlignCenter,
+                   f'{self.keys_now}/{self.keys_goal}')
+
+        food_pct = int(self.progress * 100)
+        if self.hunger_pct < 30:
+            hunger_color = QColor(231, 76, 60)
+        elif self.hunger_pct < 60:
+            hunger_color = QColor(241, 196, 15)
+        else:
+            hunger_color = QColor(120, 230, 160)
+
+        f2 = p.font()
+        f2.setPointSize(8)
+        f2.setBold(False)
+        p.setFont(f2)
+        row2 = label_rect.adjusted(0, 15, 0, -2)
+        half = row2.width() // 2
+
+        food_rect = QRect(row2.x(), row2.y(), half, row2.height())
+        p.setPen(QPen(QColor(200, 230, 210)))
+        p.drawText(food_rect, Qt.AlignmentFlag.AlignCenter, f'🍖{food_pct}%')
+
+        hunger_rect = QRect(row2.x() + half, row2.y(), row2.width() - half, row2.height())
+        p.setPen(QPen(hunger_color))
+        p.drawText(hunger_rect, Qt.AlignmentFlag.AlignCenter, f'❤{self.hunger_pct}%')
         p.end()
 
 
@@ -368,12 +688,16 @@ class Overlay(QWidget):
 
         self.pet         = Pet(cfg)
         self._click      = None
+        self._keys       = 0
         self._lock       = threading.Lock()
         self._t          = time.monotonic()
         self._going_home = False
 
         self._home = HomeButton(cfg.pet_height * 2)
         self._home.go_home.connect(self._on_go_home)
+
+        self._food_btn = FoodButton(max(48, int(cfg.pet_height * 0.7)))
+        self._food_btn.feed_clicked.connect(self._on_feed_click)
 
         QTimer(self, timeout=self._tick,        interval=16 ).start()
         QTimer(self, timeout=self._sync_bounds, interval=400).start()
@@ -387,10 +711,26 @@ class Overlay(QWidget):
             ml.daemon = True
             ml.start()
 
+        if MACOS:
+            self._setup_key_tap()
+        elif PYNPUT_KEYBOARD:
+            def _on_key(_key):
+                with self._lock:
+                    self._keys += 1
+            kl = _keyboard.Listener(on_press=_on_key)
+            kl.daemon = True
+            kl.start()
+
         self._sync_bounds()
         # retry quickly at startup until another app's window is detected
         self._startup_retries = 20
         QTimer(self, timeout=self._startup_sync, interval=100).start()
+
+    def _on_feed_click(self):
+        self.pet.feed()
+        self._food_btn.set_progress(self.pet.bowl_progress, self.pet.bowls,
+                                     self.pet.progress_keys, Pet.KEYS_PER_BOWL,
+                                     int(self.pet.hunger))
 
     def _startup_sync(self):
         if self._startup_retries <= 0:
@@ -400,7 +740,37 @@ class Overlay(QWidget):
         if r and r.width() > 80 and r.height() > 80:
             self.pet.set_bounds(r)
             self._home.update_pos(r)
+            self._food_btn.update_pos(r)
             self._startup_retries = 0   # found it — stop retrying
+
+    def _setup_key_tap(self):
+        """Global key-press tap on the main run loop (Quartz, not pynput —
+        avoids a macOS HIToolbox thread-assert crash when keyboard hooks
+        run off the main thread)."""
+        def _callback(_proxy, _type, event, _refcon):
+            with self._lock:
+                self._keys += 1
+            return event
+        try:
+            tap = Quartz.CGEventTapCreate(
+                Quartz.kCGSessionEventTap,
+                Quartz.kCGHeadInsertEventTap,
+                Quartz.kCGEventTapOptionListenOnly,
+                Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown),
+                _callback,
+                None)
+            if not tap:
+                print('[pet] could not create key tap — enable Input Monitoring '
+                      'permission in System Settings to feed via typing')
+                return
+            src = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+            Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), src,
+                                       Quartz.kCFRunLoopCommonModes)
+            Quartz.CGEventTapEnable(tap, True)
+            self._key_tap = tap   # keep references alive
+            self._key_tap_src = src
+        except Exception as e:
+            print(f'[pet] key tap setup failed: {e}')
 
     def _on_go_home(self, x: float, y: float):
         self._going_home = True
@@ -411,6 +781,7 @@ class Overlay(QWidget):
         if r and r.width() > 80 and r.height() > 80:
             self.pet.set_bounds(r)
             self._home.update_pos(r)
+            self._food_btn.update_pos(r)
 
     def _tick(self):
         now = time.monotonic()
@@ -419,13 +790,24 @@ class Overlay(QWidget):
 
         with self._lock:
             click, self._click = self._click, None
-        # ignore random clicks once heading home
+            keys,  self._keys  = self._keys, 0
         if click and not self._going_home:
-            self.pet.on_click(*click)
+            # clicking the cat itself toggles work/slack instead of moving it
+            cat_rect = QRect(int(self.pet.x - self.W/2), int(self.pet.y - self.H),
+                              self.W, self.H)
+            if cat_rect.contains(QPoint(int(click[0]), int(click[1]))):
+                self.pet.toggle_work()
+            else:
+                self.pet.on_click(*click)
+        if keys:
+            self.pet.add_keystrokes(keys)
 
         self.pet.update(dt)
         self.move(int(self.pet.x) - self.W//2, int(self.pet.y) - self.H)
         self.update()
+        self._food_btn.set_progress(self.pet.bowl_progress, self.pet.bowls,
+                                     self.pet.progress_keys, Pet.KEYS_PER_BOWL,
+                                     int(self.pet.hunger))
 
         # quit once pet has arrived home and settled
         if self._going_home and not self.pet.moving and not self.pet.chasing:
@@ -438,7 +820,9 @@ class Overlay(QWidget):
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
         p.fillRect(self.rect(), Qt.GlobalColor.transparent)
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-        draw_cat(p, self.W, self.H, self.pet.frame, self.pet.moving, self.pet.facing_right)
+        cat_top = draw_cat(p, self.W, self.H, self.pet.frame, self.pet.moving, self.pet.facing_right)
+        bar_top = draw_hunger_bar(p, self.W, self.pet.hunger, cat_top)
+        draw_speech_bubble(p, self.W, self.pet.speech, bar_top)
         p.end()
 
 
