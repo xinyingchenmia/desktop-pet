@@ -11,10 +11,9 @@ The pet roams inside whichever window you're currently using, wanders on its own
 - Stays inside your active window and updates when you switch apps
 - Wanders around on its own between clicks
 - Runs to wherever you click (faster than wandering)
-- Upload your own pet photo — background is removed automatically
-- Walk frames are auto-generated if you only upload one photo
-- House button in the top-right corner of your window — click to quit
-- Fully transparent overlay, no dock icon, never steals focus
+- All parameters are adjustable, including pet size, wander speed, wander interval, and chasing speed
+- Upload your own pet photo and background is removed automatically
+- House button in the top-right corner of your window and click to quit
 
 ## Setup
 
@@ -42,7 +41,7 @@ python pet.py
 | Wander Interval | How often it picks a new random spot |
 | Size | Height of the pet in pixels |
 
-Upload a **Rest** photo (required) and up to 3 **Walk** photos (optional). If you skip the walk photos, they are generated automatically from the rest image.
+Upload a **Rest** photo (required) and up to 3 **Walk** photos. 
 
 ## Requirements
 
