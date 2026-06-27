@@ -14,6 +14,8 @@ The pet roams inside whichever window you're currently using, wanders on its own
 - All parameters are adjustable, including pet size, wander speed, wander interval, and chasing speed
 - Upload your own pet photo and background is removed automatically
 - House button in the top-right corner of your window and click to quit
+- **Feed your pet by typing** — every 5,000 keystrokes earns a bowl of food. Click the pet itself to toggle between "working" (typing counts) and "slacking off" (typing doesn't count)
+- Hunger drains over time and empties after 30 minutes if never fed — a hungry pet moves more sluggishly. Click the food bowl icon to feed it a stockpiled bowl and fully restore its hunger
 
 ## Setup
 
@@ -22,7 +24,7 @@ pip install PyQt6 pynput pyobjc-framework-Quartz pyobjc-framework-Cocoa rembg
 python pet.py
 ```
 
-> macOS may ask for Accessibility permission the first time (needed for click tracking). Go to System Settings → Privacy & Security → Accessibility and enable it.
+> macOS may ask for Accessibility permission the first time (needed for click tracking) and Input Monitoring permission (needed for counting keystrokes to earn food). Go to System Settings → Privacy & Security → Accessibility / Input Monitoring and enable the app in both.
 
 ## Usage
 
@@ -30,7 +32,9 @@ python pet.py
 2. A settings window appears — adjust speed and size, and upload a photo of your pet
 3. Click **Launch Pet**
 4. Click anywhere on screen to make the pet run there
-5. Click the house icon (top-right of your window) to send the pet home and exit
+5. Click the pet itself to toggle work mode — type while "working" to earn bowls of food
+6. Click the food bowl icon to feed it a stockpiled bowl
+7. Click the house icon (top-right of your window) to send the pet home and exit
 
 ## Customisation
 

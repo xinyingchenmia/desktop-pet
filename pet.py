@@ -776,6 +776,15 @@ class Overlay(QWidget):
         self._going_home = True
         self.pet.on_click(x, y)
 
+    def _cat_hit_rect(self) -> QRect:
+        """Tight bounding box of the cat's current sprite, in global screen coords
+        (not the whole padded overlay window — that was swallowing nearby clicks)."""
+        pm = _SPRITES.get(f'walk{self.pet.frame % 3}', _SPRITES['rest']) \
+             if self.pet.moving else _SPRITES['rest']
+        pad = 6
+        w, h = pm.width() + pad * 2, pm.height() + pad * 2
+        return QRect(int(self.pet.x - w / 2), int(self.pet.y - h), w, h)
+
     def _sync_bounds(self):
         r = active_window_rect()
         if r and r.width() > 80 and r.height() > 80:
@@ -793,9 +802,7 @@ class Overlay(QWidget):
             keys,  self._keys  = self._keys, 0
         if click and not self._going_home:
             # clicking the cat itself toggles work/slack instead of moving it
-            cat_rect = QRect(int(self.pet.x - self.W/2), int(self.pet.y - self.H),
-                              self.W, self.H)
-            if cat_rect.contains(QPoint(int(click[0]), int(click[1]))):
+            if self._cat_hit_rect().contains(QPoint(int(click[0]), int(click[1]))):
                 self.pet.toggle_work()
             else:
                 self.pet.on_click(*click)
