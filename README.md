@@ -24,7 +24,10 @@ pip install PyQt6 pynput pyobjc-framework-Quartz pyobjc-framework-Cocoa rembg
 python pet.py
 ```
 
-> macOS may ask for Accessibility permission the first time (needed for click tracking) and Input Monitoring permission (needed for counting keystrokes to earn food). Go to System Settings → Privacy & Security → Accessibility / Input Monitoring and enable the app in both.
+> macOS needs Accessibility permission (for click tracking) and Input Monitoring permission (for counting keystrokes to earn food). Go to System Settings → Privacy & Security → Accessibility / Input Monitoring and enable both.
+>
+> - **Running from source** (`python pet.py`): grant permission to your terminal app (Terminal, iTerm, etc.) — the OS attributes the request to whatever process launched Python, not to `pet.py` itself.
+> - **Running the packaged app** (downloaded from [Releases](../../releases)): grant permission to `Desktop Pet.app` directly.
 
 ## Usage
 
